@@ -1,6 +1,6 @@
 # GCP-Places-API-Vet-Scraper
 
-Internal research project: a small script to experiment with Google Maps Platform Places API (Nearby Search + Place Details) for discovering businesses (e.g., veterinary clinics) around a geographic point.
+Internal research project: a small script to experiment with Google Maps Platform Places API (Nearby Search + Place Details) for discovering businesses (e.g., veterinary clinics) around a geographic point / current IP location.
 
 ## Quickstart
 
@@ -32,16 +32,10 @@ python .\main.py --lat 37.4219 --lng -122.0840 --radius 1000 --type restaurant -
 
 6. Output: the script writes a JSON file (default `places_full.json`) containing place details for inspection.
 
-## Notes & Safety
-
-- The script auto-loads `.env` if `python-dotenv` is installed. If not, set `GCP_PLACES_API_KEY` in your shell.
-- Calls to Google Places API may incur billing — test with small radius and few requests first.
-- The repository contains `.env.example` and `.gitignore` to help keep secrets out of version control. Do not commit your real API key.
-
 ## Files
 
 - `main.py` — the Nearby Search + Place Details test script.
-- `.env` / `.env.example` — environment key guidance (keep real keys out of git).
+- `.env` / `.env.example` — environment keys.
 - `requirements.txt` — Python dependencies.
 
 ## Next steps
