@@ -441,9 +441,129 @@ def main(argv: Optional[List[str]] = None) -> int:
 		out_filename = f"{base_name}_{timestamp}.json"
 		out_path = os.path.join(output_dir, out_filename)
 
-		# Write full detailed results to JSON for inspection
+		# Build a simplified, flat JSON that's CSV-friendly and contains the most useful fields per place
+		from urllib.parse import urlparse, parse_qs
+
+		def extract_component(ac_list, ac_type, short=False):
+			if not ac_list:
+				return ""
+			for ac in ac_list:
+				types = ac.get("types", [])
+				if ac_type in types:
+					return ac.get("short_name") if short else ac.get("long_name")
+			return ""
+
+		simplified: List[Dict[str, Any]] = []
+		for d in detailed_places:
+			res = d.get("result") or {}
+			# Basic fields
+			name = res.get("name", "")
+			address = res.get("formatted_address", "")
+			types = res.get("types", []) or []
+			primary_category = types[0] if types else ""
+			phone = res.get("formatted_phone_number", "")
+
+			# Address components
+			ac = res.get("address_components", []) or []
+			zip_code = extract_component(ac, "postal_code")
+			city = extract_component(ac, "locality") or extract_component(ac, "postal_town") or extract_component(ac, "administrative_area_level_2")
+			state = extract_component(ac, "administrative_area_level_1")
+			state_code = extract_component(ac, "administrative_area_level_1", short=True)
+
+			# Plus code
+			plus = res.get("plus_code") or {}
+			plus_code = plus.get("global_code") or plus.get("compound_code") or ""
+
+			website = res.get("website", "")
+
+			# CID (try to parse from maps URL if present)
+			cid = ""
+			maps_url = res.get("url") or res.get("canonical_url") or ""
+			if maps_url:
+				try:
+					q = parse_qs(urlparse(maps_url).query)
+					cid_vals = q.get("cid")
+					if cid_vals:
+						cid = cid_vals[0]
+				except Exception:
+					cid = ""
+
+			# Location
+			lat_val = None
+			lng_val = None
+			geom = res.get("geometry") or {}
+			loc = geom.get("location") if geom else None
+			if loc:
+				lat_val = loc.get("lat")
+				lng_val = loc.get("lng")
+
+			# Ratings
+			total_reviews = res.get("user_ratings_total") or 0
+			avg_rating = res.get("rating") or 0
+
+			# Star breakdown from sampled reviews (may be partial)
+			star_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+			for rv in res.get("reviews", []) or []:
+				rscore = rv.get("rating")
+				try:
+					ir = int(round(float(rscore)))
+				except Exception:
+					continue
+				if ir < 1:
+					ir = 1
+				if ir > 5:
+					ir = 5
+				star_counts[ir] = star_counts.get(ir, 0) + 1
+
+			# Opening hours (weekday_text is usually ['Monday: ...', ...])
+			oh = res.get("opening_hours") or {}
+			weekday_text = oh.get("weekday_text") or []
+			# Map defaults
+			hours_map = {"Monday": "", "Tuesday": "", "Wednesday": "", "Thursday": "", "Friday": "", "Saturday": "", "Sunday": ""}
+			for line in weekday_text:
+				if not isinstance(line, str):
+					continue
+				if ":" in line:
+					try:
+						day, times = line.split(":", 1)
+						day = day.strip()
+						hours_map[day] = times.strip()
+					except Exception:
+						continue
+
+			simplified.append({
+				"business_name": name,
+				"address": address,
+				"primary_category": primary_category,
+				"phone": phone,
+				"zip_code": zip_code,
+				"city": city,
+				"state": state,
+				"state_code": state_code,
+				"plus_code": plus_code,
+				"website": website,
+				"cid": cid,
+				"latitude": lat_val,
+				"longitude": lng_val,
+				"total_reviews": total_reviews,
+				"average_rating": avg_rating,
+				"1_star_reviews": star_counts[1],
+				"2_star_reviews": star_counts[2],
+				"3_star_reviews": star_counts[3],
+				"4_star_reviews": star_counts[4],
+				"5_star_reviews": star_counts[5],
+				"monday_hours": hours_map.get("Monday", ""),
+				"tuesday_hours": hours_map.get("Tuesday", ""),
+				"wednesday_hours": hours_map.get("Wednesday", ""),
+				"thursday_hours": hours_map.get("Thursday", ""),
+				"friday_hours": hours_map.get("Friday", ""),
+				"saturday_hours": hours_map.get("Saturday", ""),
+				"sunday_hours": hours_map.get("Sunday", ""),
+			})
+
+		# Write simplified JSON (pretty-printed for readability)
 		with open(out_path, "w", encoding="utf-8") as f:
-			json.dump({"search_center": {"lat": lat, "lng": lng}, "places": detailed_places}, f, ensure_ascii=False, indent=2)
+			json.dump({"search_center": {"lat": lat, "lng": lng}, "places": simplified}, f, ensure_ascii=False, indent=2)
 
 		print(f"Wrote detailed places to {out_path}")
 		return 0
