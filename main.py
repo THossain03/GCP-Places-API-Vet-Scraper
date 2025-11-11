@@ -60,40 +60,54 @@ def get_ip_location() -> Optional[Tuple[float, float]]:
 	return None
 
 
-def nearby_search(lat: float, lng: float, radius: int, place_type: str, api_key: str) -> List[Dict[str, Any]]:
-	"""Perform a Nearby Search and return aggregated result items (raw API results).
+def nearby_search(lat: float, lng: float, radius: int, api_key: str, queries: List[Dict[str, Optional[str]]]) -> List[Dict[str, Any]]:
+	"""Perform multiple Nearby Search queries (type/keyword combos) and return deduplicated result items.
 
-	This follows pagination using next_page_token (up to 3 pages as supported by the API).
+	`queries` should be a list of dicts with either 'type' or 'keyword' (or both). Example:
+	  [{'type': 'veterinary_care'}, {'keyword': 'veterinary'}, {'keyword': 'vet'}]
+
+	We follow pagination for each query and dedupe by place_id.
 	"""
 	base = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-	results: List[Dict[str, Any]] = []
-	params = {
-		"location": f"{lat},{lng}",
-		"radius": radius,
-		"type": place_type,
-		"key": api_key,
-	}
+	results_by_id: Dict[str, Dict[str, Any]] = {}
 
-	page = 0
-	while True:
-		page += 1
-		resp = requests.get(base, params=params, timeout=10)
-		resp.raise_for_status()
-		data = resp.json()
-		results.extend(data.get("results", []))
-
-		next_token = data.get("next_page_token")
-		if not next_token or page >= 3:
-			break
-
-		# Per Google docs, next_page_token may take a short time to become valid.
-		time.sleep(2)
+	for q in queries:
 		params = {
-			"pagetoken": next_token,
+			"location": f"{lat},{lng}",
+			"radius": radius,
 			"key": api_key,
 		}
+		if q.get("type"):
+			params["type"] = q["type"]
+		if q.get("keyword"):
+			params["keyword"] = q["keyword"]
 
-	return results
+		page = 0
+		while True:
+			page += 1
+			resp = requests.get(base, params=params, timeout=10)
+			resp.raise_for_status()
+			data = resp.json()
+			for item in data.get("results", []):
+				pid = item.get("place_id")
+				if not pid:
+					continue
+				# Keep first-seen item for each place_id
+				if pid not in results_by_id:
+					results_by_id[pid] = item
+
+			next_token = data.get("next_page_token")
+			if not next_token or page >= 3:
+				break
+
+			# Per Google docs, next_page_token may take a short time to become valid.
+			time.sleep(2)
+			params = {
+				"pagetoken": next_token,
+				"key": api_key,
+			}
+
+	return list(results_by_id.values())
 
 
 def place_details(place_id: str, api_key: str) -> Dict[str, Any]:
@@ -132,9 +146,186 @@ def place_details(place_id: str, api_key: str) -> Dict[str, Any]:
 	return r.json()
 
 
+TIER1_TYPES = {
+	"veterinary_care",
+	"veterinarian",
+	"veterinary_pharmacy",
+	"animal_hospital",
+	"emergency_veterinarian_service",
+}
+
+# Secondary types that are pet-related; require stronger textual evidence to classify as vet
+TIER2_TYPES = {
+	"pet_store",
+	"pet_groomer",
+	"pet_care_service",
+	"pet_boarding_service",
+	"pet_trainer",
+	"animal_shelter",
+}
+
+# Wider sweep (optional) — farm and hospital variants
+TIER3_TYPES = {
+	"farm",
+	"animal_husbandry",
+}
+
+KEYWORD_STRONG = [
+	"vet",
+	"veterinary",
+	"veterinarian",
+	"animal",
+	"pet",
+	"clinic",
+	"animal hospital",
+	"spay",
+	"neuter",
+	"canine",
+	"feline",
+]
+
+
+def text_has_keyword(text: Optional[str]) -> bool:
+	if not text:
+		return False
+	t = text.lower()
+	for kw in KEYWORD_STRONG:
+		if kw in t:
+			return True
+	return False
+
+
+def classify_place(details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	"""Classify a place details response into Tier 1 (highly likely), Tier 2 (probable), or None.
+
+	Returns an analysis dict when the place should be kept, or None to discard.
+	"""
+	res = details.get("result", {})
+	types = set(res.get("types", []))
+	name = res.get("name", "")
+	address = res.get("formatted_address", "")
+	website = res.get("website", "")
+
+	# Tier 1: explicit type match
+	matched_t1 = list(TIER1_TYPES & types)
+	if matched_t1:
+		return {
+			"tier": 1,
+			"label": "highly likely vet clinic/hospital with BMS",
+			"match": "type",
+			"matched_types": matched_t1,
+		}
+
+	# Tier 2: secondary types but require textual evidence
+	matched_t2 = list(TIER2_TYPES & types)
+	if matched_t2:
+		# Strong if name/address/website contains vet-related keywords
+		if text_has_keyword(name) or text_has_keyword(address) or text_has_keyword(website):
+			return {
+				"tier": 2,
+				"label": "probable",
+				"match": "type+keyword",
+				"matched_types": matched_t2,
+			}
+
+	# Tier 3: optional wider-sweep types — treat similarly to Tier2 but weaker
+	matched_t3 = list(TIER3_TYPES & types)
+	if matched_t3:
+		if text_has_keyword(name) or text_has_keyword(address) or text_has_keyword(website):
+			return {
+				"tier": 3,
+				"label": "possible (wider sweep)",
+				"match": "type+keyword",
+				"matched_types": matched_t3,
+			}
+
+	# Also consider places that don't have vet types but whose text strongly indicates veterinary
+	if text_has_keyword(name) or text_has_keyword(address) or text_has_keyword(website):
+		# Without vet types this is weaker but still useful — mark as probable (tier 2)
+		return {
+			"tier": 2,
+			"label": "probable (text-match)",
+			"match": "keyword",
+		}
+
+	return None
+
+
+def score_place(details: Dict[str, Any]) -> Dict[str, Any]:
+	"""Compute a heuristic score (0-100) estimating likelihood the place exposes appointment/slot-level BMS.
+
+	Scoring is conservative and local-only. It combines:
+	  - type-based signals (strong if 'veterinary_care')
+	  - textual keyword matches in name/address/website
+	  - presence of booking-related words on the website URL or in known booking providers
+	  - small boosts for contact presence and ratings
+
+	Returns a dict: {score: float, reasons: {name:weight,...}}
+	"""
+	res = details.get("result", {})
+	types = set(res.get("types", []))
+	name = (res.get("name") or "").lower()
+	address = (res.get("formatted_address") or "").lower()
+	website = (res.get("website") or "").lower()
+	phone = bool(res.get("formatted_phone_number"))
+
+	reasons: Dict[str, float] = {}
+	score = 0.0
+
+	# Type signals
+	if "veterinary_care" in types:
+		reasons["type:veterinary_care"] = 60.0
+		score += 60.0
+	else:
+		inter = TIER2_TYPES & types
+		if inter:
+			# weaker signal for secondary types
+			reasons[f"type:{','.join(sorted(inter))}"] = 20.0
+			score += 20.0
+
+	# Keyword matches in name/address/website
+	kw_hits = 0
+	for kw in KEYWORD_STRONG:
+		if kw in name:
+			kw_hits += 1
+			reasons[f"name_contains:{kw}"] = reasons.get(f"name_contains:{kw}", 0) + 6.0
+			score += 6.0
+		if kw in address:
+			kw_hits += 1
+			reasons[f"address_contains:{kw}"] = reasons.get(f"address_contains:{kw}", 0) + 3.0
+			score += 3.0
+		if kw in website:
+			kw_hits += 1
+			reasons[f"website_contains:{kw}"] = reasons.get(f"website_contains:{kw}", 0) + 8.0
+			score += 8.0
+
+	# Booking/appointment signals on website URL itself (cheap heuristic)
+	booking_tokens = ["book", "appointment", "schedule", "online-booking", "reserve", "booking", "calendly", "setmore", "patient portal", "portal", "appointments"]
+	for bt in booking_tokens:
+		if bt in website:
+			reasons[f"website_book_token:{bt}"] = 15.0
+			score += 15.0
+			break
+
+	# Presence of phone is a small positive signal
+	if phone:
+		reasons["has_phone"] = 5.0
+		score += 5.0
+
+	# Ratings / popularity: normalize user_ratings_total into a small boost (capped)
+	urt = res.get("user_ratings_total") or 0
+	if urt > 0:
+		boost = min(5.0, urt / 1000.0 * 5.0)  # up to +5 points for many ratings
+		reasons["user_ratings_total"] = round(boost, 2)
+		score += boost
+
+	# Cap score to 100
+	final_score = max(0.0, min(100.0, score))
+	return {"score": round(final_score, 2), "reasons": reasons}
+
 def main(argv: Optional[List[str]] = None) -> int:
 	parser = argparse.ArgumentParser(description="Places API test script: Nearby Search + Details")
-	parser.add_argument("--radius", type=int, default=10000, help="search radius in meters (default 10000 = 10 km)")
+	parser.add_argument("--radius", type=int, default=25000, help="search radius in meters (default 25000 = 25 km)")
 	parser.add_argument("--type", default="restaurant", help="place type to search for (default 'restaurant')")
 	parser.add_argument("--lat", type=float, help="latitude (skip IP lookup)")
 	parser.add_argument("--lng", type=float, help="longitude (skip IP lookup)")
@@ -156,9 +347,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 		lat, lng = args.lat, args.lng
 
 	try:
-		print(f"Running Nearby Search: type={args.type}, radius={args.radius}m")
-		raw_results = nearby_search(lat, lng, args.radius, args.type, API_KEY)
-		print(f"Nearby Search returned {len(raw_results)} raw results")
+		print(f"Running targeted Nearby Searches for veterinary-related places within radius={args.radius}m")
+
+		# Build queries from tiered types and a few keyword fallbacks
+		type_queries: List[Dict[str, Optional[str]]] = []
+		for t in sorted(list(TIER1_TYPES | TIER2_TYPES | TIER3_TYPES)):
+			type_queries.append({"type": t})
+		# Add some keyword fallbacks to catch variations
+		keyword_queries = [{"keyword": k} for k in ["veterinary", "vet", "animal hospital", "pet clinic"]]
+		queries = type_queries + keyword_queries
+
+		# Single-radius search only (minimize API calls) — default radius is 25km
+		raw_results = nearby_search(lat, lng, args.radius, API_KEY, queries)
+		print(f"Nearby Search returned {len(raw_results)} unique raw results (deduped)")
 
 		detailed_places: List[Dict[str, Any]] = []
 		for idx, item in enumerate(raw_results, start=1):
@@ -171,7 +372,65 @@ def main(argv: Optional[List[str]] = None) -> int:
 				print(f"  ERROR fetching details for {place_id}: {e}")
 				# keep the raw item as fallback
 				details = {"error": str(e), "raw": item}
-			detailed_places.append(details)
+
+			# Require website presence (we need a website to query for appointment widget etc.)
+			res_quick = details.get("result", {})
+			website = res_quick.get("website")
+			if not website:
+				print(f"  Discarding {place_id}: no website present")
+				continue
+
+			# Compute a heuristic AI-style score (local rules) to rank BMS likelihood
+			score_info = score_place(details)
+			heuristic_score = score_info.get("score", 0.0)
+
+			# Decision rules for inclusion using the heuristic score:
+			# - If heuristic > 30: include immediately (strong signal)
+			# - If heuristic < 10: discard immediately (too weak)
+			# - If heuristic in [10,30]: treat as borderline and use the heuristic value
+			final_score = heuristic_score
+
+			if heuristic_score > 30.0:
+				print(f"  Heuristic strong: {place_id} score={heuristic_score} (>30) -> include")
+			elif heuristic_score < 10.0:
+				print(f"  Heuristic weak: {place_id} score={heuristic_score} (<10) -> discard")
+				continue
+			else:
+				# borderline case: 10-30 -> use heuristic
+				print(f"  Borderline {place_id} (heuristic={heuristic_score}) -> using heuristic")
+				final_score = heuristic_score
+
+			# Require final score > 20 to include
+			if final_score <= 20.0:
+				print(f"  Discarding {place_id}: final_score={final_score} <= 20.0")
+				continue
+
+			# Optionally also derive a tiered label from classify_place (keeps previous behavior)
+			tier_info = classify_place(details) or {}
+
+			# Attach analysis and scoring to the top-level details object
+			details_out = dict(details)  # shallow copy
+			details_out["analysis"] = tier_info
+			details_out["heuristic_score"] = heuristic_score
+			details_out["final_score"] = final_score
+			# Script stores heuristic analysis only
+			details_out["score_reasons"] = score_info.get("reasons", {})
+
+			# Provide a concise candidate summary for downstream heuristics
+			res = details_out.get("result", {})
+			candidate_summary = {
+				"place_id": res.get("place_id"),
+				"name": res.get("name"),
+				"formatted_address": res.get("formatted_address"),
+				"types": res.get("types", []),
+				"website": res.get("website"),
+				"formatted_phone_number": res.get("formatted_phone_number"),
+				"rating": res.get("rating"),
+				"user_ratings_total": res.get("user_ratings_total"),
+			}
+			details_out["candidate_summary"] = candidate_summary
+
+			detailed_places.append(details_out)
 
 		# Prepare output directory and filename with timestamp
 		output_dir = "outputs"
