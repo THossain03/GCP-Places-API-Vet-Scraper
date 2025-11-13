@@ -17,6 +17,9 @@ import time
 import json
 import argparse
 from typing import Tuple, List, Dict, Any, Optional
+import csv
+import shutil
+import re
 
 import requests
 
@@ -329,7 +332,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 	parser.add_argument("--type", default="restaurant", help="place type to search for (default 'restaurant')")
 	parser.add_argument("--lat", type=float, help="latitude (skip IP lookup)")
 	parser.add_argument("--lng", type=float, help="longitude (skip IP lookup)")
-	parser.add_argument("--out", default="places_full.json", help="output JSON filename")
 	args = parser.parse_args(argv)
 
 	if API_KEY == "YOUR_API_KEY_HERE":
@@ -436,8 +438,40 @@ def main(argv: Optional[List[str]] = None) -> int:
 		output_dir = "outputs"
 		os.makedirs(output_dir, exist_ok=True)
 		timestamp = time.strftime("%Y%m%dT%H%M%S")
-		# Use the provided --out as a base name (without directory or extension)
-		base_name = os.path.splitext(os.path.basename(args.out))[0]
+
+		# Archive any existing top-level outputs matching the pattern
+		archives_base = os.path.join(output_dir, "archives")
+		jsons_dir = os.path.join(archives_base, "jsons")
+		csvs_dir = os.path.join(archives_base, "csvs")
+		os.makedirs(jsons_dir, exist_ok=True)
+		os.makedirs(csvs_dir, exist_ok=True)
+
+		# Only match files directly under outputs/ with the expected naming pattern
+		pattern = re.compile(r"^places_full_\d{8}T\d{6}\.(json|csv)$")
+		for fname in os.listdir(output_dir):
+			# Skip archives directory and subdirectories
+			fpath = os.path.join(output_dir, fname)
+			if not os.path.isfile(fpath):
+				continue
+			if not pattern.match(fname):
+				continue
+			lower = fname.lower()
+			if lower.endswith('.json'):
+				dest_dir = jsons_dir
+			elif lower.endswith('.csv'):
+				dest_dir = csvs_dir
+			else:
+				dest_dir = archives_base
+
+			dest = os.path.join(dest_dir, fname)
+			try:
+				shutil.move(fpath, dest)
+				print(f"Archived existing output {fpath} -> {dest}")
+			except Exception as e:
+				print(f"Failed to archive {fpath}: {e}")
+
+		# Use a fixed base name so outputs are predictable
+		base_name = "places_full"
 		out_filename = f"{base_name}_{timestamp}.json"
 		out_path = os.path.join(output_dir, out_filename)
 
@@ -565,7 +599,54 @@ def main(argv: Optional[List[str]] = None) -> int:
 		with open(out_path, "w", encoding="utf-8") as f:
 			json.dump({"search_center": {"lat": lat, "lng": lng}, "places": simplified}, f, ensure_ascii=False, indent=2)
 
-		print(f"Wrote detailed places to {out_path}")
+		# Also write a CSV alongside the JSON for easy analysis / spreadsheet import.
+		csv_filename = f"{base_name}_{timestamp}.csv"
+		csv_path = os.path.join(output_dir, csv_filename)
+
+		# Define CSV columns in a stable order to match the JSON fields.
+		fieldnames = [
+			"business_name",
+			"address",
+			"primary_category",
+			"phone",
+			"zip_code",
+			"city",
+			"state",
+			"state_code",
+			"plus_code",
+			"website",
+			"cid",
+			"latitude",
+			"longitude",
+			"total_reviews",
+			"average_rating",
+			"1_star_reviews",
+			"2_star_reviews",
+			"3_star_reviews",
+			"4_star_reviews",
+			"5_star_reviews",
+			"monday_hours",
+			"tuesday_hours",
+			"wednesday_hours",
+			"thursday_hours",
+			"friday_hours",
+			"saturday_hours",
+			"sunday_hours",
+		]
+
+		try:
+			# Use newline='' for correct newline handling on Windows
+			with open(csv_path, "w", encoding="utf-8", newline='') as csvf:
+				writer = csv.DictWriter(csvf, fieldnames=fieldnames)
+				writer.writeheader()
+				for row in simplified:
+					# Ensure all keys exist and None -> '' for CSV cleanliness
+					out_row = {k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames}
+					writer.writerow(out_row)
+			print(f"Wrote JSON to {out_path} and CSV to {csv_path}")
+		except Exception as e:
+			print(f"Wrote JSON to {out_path} but failed to write CSV: {e}")
+
 		return 0
 
 	except requests.HTTPError as e:
